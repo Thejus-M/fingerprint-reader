@@ -1,0 +1,36 @@
+#!/bin/bash
+# Rebuild libfprint with the goodixtls53xd driver from driver/PKGBUILD.
+# Only needed to move to a newer libfprint base; the installed package is fine otherwise.
+#
+# Two things are not optional:
+#   - BUILDDIR must have no space in it: makepkg passes $srcdir to
+#     -ffile-prefix-map and "MY Drive" breaks the compiler invocation.
+#   - epoch must stay at 2 or higher, or pacman and the omarchy fingerprint
+#     menu entry will both replace this driver with the stock build.
+
+set -euo pipefail
+
+proj_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+build_dir=${BUILDDIR:-/tmp/mkbuild}
+
+deps=(meson gobject-introspection glib2-devel devtools)
+if omarchy-pkg-missing "${deps[@]}" 2>/dev/null; then
+  echo "Installing build dependencies: ${deps[*]}"
+  sudo pacman -S --needed -- "${deps[@]}"
+  installed_deps=1
+fi
+
+cd "$proj_dir/driver"
+BUILDDIR="$build_dir" PKGDEST="$PWD" makepkg -f --noconfirm
+
+pkg=$(ls -1 "$PWD"/libfprint-git-2:*.pkg.tar.zst | sort -V | tail -1)
+echo
+echo "Built: $pkg"
+echo "Install it with:"
+echo "  sudo pacman -U --ask 4 -- \"$pkg\""
+
+if [[ ${installed_deps:-0} == 1 ]]; then
+  echo
+  echo "Build dependencies were installed for this run. Remove them with:"
+  echo "  sudo pacman -Rns ${deps[*]}"
+fi

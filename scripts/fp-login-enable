@@ -1,0 +1,98 @@
+#!/bin/bash
+# Make the SDDM greeter accept the fingerprint at boot.
+#
+# Two changes, both reversible with fp-login-disable:
+#   1. /etc/pam.d/sddm gets omarchy's clamshell gate + `auth sufficient pam_fprintd.so`,
+#      the same two lines omarchy puts in /etc/pam.d/sudo and /etc/pam.d/polkit-1.
+#      `sufficient` means a failed or absent reader falls through to the password,
+#      so the password path is untouched.
+#   2. SDDM autologin is switched off, because an autologin greeter never asks
+#      for anything. The config file is MOVED OUT of /etc/sddm.conf.d, not
+#      renamed inside it: sddm.conf(5) says "Configuration loads all files in
+#      the configuration directories", with no *.conf filter, so a file renamed
+#      to autologin.conf.disabled inside that directory is still read and
+#      autologin stays on. It is moved to /etc/sddm.autologin.conf.disabled and
+#      a copy is kept in backup/.
+#
+# Run it as your user; it calls sudo where it needs to.
+
+set -euo pipefail
+
+proj_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+backup_dir="$proj_dir/backup"
+stamp=$(date +%Y%m%d-%H%M%S)
+pam_file=/etc/pam.d/sddm
+
+gate='auth      [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed'
+fprintd='auth      sufficient pam_fprintd.so'
+
+# Refuse to proceed without a working reader and an enrolled finger: a greeter
+# wired to a reader that cannot answer is pure friction.
+if ! fprintd-list "$USER" 2>/dev/null | grep -q '^ - #'; then
+  echo "No enrolled fingerprint for $USER (or no device). Fix that first:" >&2
+  echo "  $proj_dir/scripts/fp-status" >&2
+  exit 1
+fi
+
+mkdir -p "$backup_dir"
+
+# --- 1. PAM ---
+if grep -q pam_fprintd.so "$pam_file"; then
+  echo "$pam_file already has pam_fprintd — leaving it alone."
+else
+  sudo cp -a "$pam_file" "$pam_file.bak.$stamp"
+  cp -a "$pam_file" "$backup_dir/sddm.pam.bak.$stamp"
+  # Insert both lines before the first auth line in the file.
+  sudo awk -v gate="$gate" -v fprintd="$fprintd" '
+    !done && /^[[:space:]]*-?auth/ { print gate; print fprintd; done = 1 }
+    { print }
+  ' "$pam_file" > /tmp/sddm.pam.new
+  sudo install -m 644 -o root -g root /tmp/sddm.pam.new "$pam_file"
+  rm -f /tmp/sddm.pam.new
+  echo "Patched $pam_file (backup: $pam_file.bak.$stamp)"
+fi
+
+# --- 2. autologin ---
+# Every file in /etc/sddm.conf.d counts, whatever its extension (see the note at
+# the top), so scan them all and not just *.conf.
+shopt -s dotglob nullglob
+disabled_any=0
+for f in /etc/sddm.conf.d/* /etc/sddm.conf; do
+  [[ -f $f ]] || continue
+  # A non-empty User= inside [Autologin] is what turns autologin on.
+  awk '
+    /^[[:space:]]*\[/ { in_al = ($0 ~ /^[[:space:]]*\[Autologin\]/); next }
+    in_al && /^[[:space:]]*User[[:space:]]*=[[:space:]]*[^[:space:]]/ { found = 1 }
+    END { exit !found }
+  ' "$f" || continue
+
+  if [[ $f == /etc/sddm.conf ]]; then
+    # The compatibility file is not ours to move; blank the two keys instead.
+    sudo cp -a "$f" "$f.bak.$stamp"
+    cp -a "$f" "$backup_dir/$(basename "$f").bak.$stamp"
+    sudo sed -i -E 's/^(\s*)(User|Session)(\s*=).*/\1\2\3/' "$f"
+    echo "Emptied Autologin User/Session in $f (backup: $f.bak.$stamp)"
+  else
+    cp -a "$f" "$backup_dir/$(basename "$f").bak.$stamp"
+    sudo mv -- "$f" "/etc/sddm.autologin.conf.disabled"
+    echo "Moved $f out of the config directory -> /etc/sddm.autologin.conf.disabled"
+  fi
+  disabled_any=1
+done
+(( disabled_any )) || echo "No SDDM autologin config in effect — the greeter already prompts."
+
+cat <<'TXT'
+
+Done. Nothing restarted, so this session is unaffected; it takes effect at the
+next boot or SDDM restart.
+
+Test it the safe way first, without rebooting:
+  1. Switch to a text console: Ctrl+Alt+F2, log in with your password.
+  2. From there:  sudo systemctl restart sddm
+     That kills the graphical session (unsaved work is lost), and the greeter
+     comes back. Touch the sensor, or press Enter on an empty password field if
+     the theme shows no fingerprint hint — pam_fprintd takes over then.
+  3. Password still works at that greeter either way.
+
+To undo both changes:  scripts/fp-login-disable
+TXT

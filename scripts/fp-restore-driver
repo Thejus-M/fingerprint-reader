@@ -1,0 +1,22 @@
+#!/bin/bash
+# Reinstall the kept goodixtls53xd libfprint package, for the case where
+# something replaced it with the stock build and the reader went silent.
+
+set -euo pipefail
+
+proj_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+pkg=$(ls -1 "$proj_dir"/driver/libfprint-git-2:*.pkg.tar.zst 2>/dev/null | sort -V | tail -1)
+
+if [[ -z ${pkg:-} ]]; then
+  echo "No built package in $proj_dir/driver — run scripts/fp-rebuild first." >&2
+  exit 1
+fi
+
+echo "Installing: $pkg"
+sudo pacman -U --ask 4 -- "$pkg"
+sudo systemctl restart fprintd || true
+echo
+fprintd-list "$USER" || true
+echo
+echo "If it lists the Goodix sensor and your finger, you are done."
+echo "If it says 'No devices available', check: journalctl -u fprintd -b --no-pager | tail -30"

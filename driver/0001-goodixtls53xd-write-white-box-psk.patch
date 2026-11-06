@@ -1,0 +1,179 @@
+diff --git i/libfprint/drivers/goodixtls/goodix53xd.c w/libfprint/drivers/goodixtls/goodix53xd.c
+index ac0486b..fd75179 100644
+--- i/libfprint/drivers/goodixtls/goodix53xd.c
++++ w/libfprint/drivers/goodixtls/goodix53xd.c
+@@ -120,6 +120,12 @@ struct _FpiDeviceGoodixTls53XD {
+   // before calling fpi_ssm_mark_failed(), which asserts none is pending.
+   gboolean poll_timeout_pending;
+ 
++  // TRUE once the device's PSK has been confirmed to match the driver's
++  gboolean psk_ok;
++  // TRUE once this open has written the white-box PSK, so that a second
++  // mismatch fails instead of looping
++  gboolean psk_write_attempted;
++
+   // Deferred verify/identify result reporting
+   gboolean verify_wait_finger_up;
+   gboolean pending_result_report;
+@@ -267,12 +273,27 @@ static void check_preset_psk_read(FpDevice* dev, gboolean success,
+     }
+ 
+     if (memcmp(psk, goodix_53xd_psk_0, sizeof(goodix_53xd_psk_0))) {
++        FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
++
++        // The sensor still holds the key its OEM driver paired it with, so the
++        // handshake cannot be completed. Write the white-box PSK once and read
++        // it back; a mismatch after that is fatal.
++        if (!self->psk_write_attempted) {
++            fp_warn("Device PSK 0x%s does not match the driver's, writing the "
++                    "white-box PSK",
++                    psk_str);
++            fpi_ssm_next_state(user_data);
++            return;
++        }
++
+         g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                     "Invalid device PSK: 0x%s", psk_str);
+         fpi_ssm_mark_failed(user_data, error);
+         return;
+     }
+ 
++    FPI_DEVICE_GOODIXTLS53XD(dev)->psk_ok = TRUE;
++
+     fpi_ssm_next_state(user_data);
+ }
+ 
+@@ -331,6 +352,7 @@ enum open_states {
+     OPEN_NOP,
+     OPEN_CHECK_FW_VER,
+     OPEN_CHECK_PSK,
++    OPEN_WRITE_PSK,
+     OPEN_RESET,
+     OPEN_OTP,
+     OPEN_SET_MCU_IDLE,
+@@ -348,6 +370,72 @@ static void open_tls_complete(FpDevice* dev, gpointer ssm, GError* error)
+     fpi_ssm_next_state(ssm);
+ }
+ 
++static void check_preset_psk_write(FpDevice* dev, guint8* data,
++                                  guint16 length, gpointer user_data,
++                                  GError* error)
++{
++    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
++
++    if (error) {
++        fpi_ssm_mark_failed(user_data, error);
++        return;
++    }
++
++    if (length < sizeof(guint8) || data[0] != 0x00) {
++        g_set_error(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
++                    "Device rejected the PSK write (reply 0x%02x)",
++                    length < sizeof(guint8) ? 0xff : data[0]);
++        fpi_ssm_mark_failed(user_data, error);
++        return;
++    }
++
++    self->psk_write_attempted = TRUE;
++
++    // Read the PSK back: only the device's own hash of it decides whether the
++    // pairing is now the one this driver can speak.
++    fpi_ssm_jump_to_state(user_data, OPEN_CHECK_PSK);
++}
++
++// Builds the preset-PSK write frame the 53xd expects, which
++// goodix_send_preset_psk_write() does not produce: a total/length/offset
++// header, then the pre-flags, the write flags, the blob length and the blob.
++static guint8* psk_write_payload(guint16* out_length)
++{
++    const guint16 body_length = sizeof(goodix_53xd_psk_write_pre_flags) +
++                                2 * sizeof(guint32) +
++                                sizeof(goodix_53xd_psk_white_box);
++    const guint16 payload_length = 3 * sizeof(guint32) + body_length;
++    guint8* payload = g_malloc0(payload_length);
++    guint8* p = payload;
++    guint32 v;
++
++    v = GUINT32_TO_LE(body_length);
++    memcpy(p, &v, sizeof(v));
++    p += sizeof(v);
++    v = GUINT32_TO_LE(body_length);
++    memcpy(p, &v, sizeof(v));
++    p += sizeof(v);
++    v = GUINT32_TO_LE(0);
++    memcpy(p, &v, sizeof(v));
++    p += sizeof(v);
++
++    memcpy(p, goodix_53xd_psk_write_pre_flags,
++           sizeof(goodix_53xd_psk_write_pre_flags));
++    p += sizeof(goodix_53xd_psk_write_pre_flags);
++
++    v = GUINT32_TO_LE(GOODIX_53XD_PSK_WRITE_FLAGS);
++    memcpy(p, &v, sizeof(v));
++    p += sizeof(v);
++    v = GUINT32_TO_LE(sizeof(goodix_53xd_psk_white_box));
++    memcpy(p, &v, sizeof(v));
++    p += sizeof(v);
++
++    memcpy(p, goodix_53xd_psk_white_box, sizeof(goodix_53xd_psk_white_box));
++
++    *out_length = payload_length;
++    return payload;
++}
++
+ static void open_run_state(FpiSsm* ssm, FpDevice* dev)
+ {
+     switch (fpi_ssm_get_cur_state(ssm)) {
+@@ -374,6 +462,22 @@ static void open_run_state(FpiSsm* ssm, FpDevice* dev)
+                                     check_preset_psk_read, ssm);
+         break;
+ 
++    case OPEN_WRITE_PSK: {
++        guint16 payload_length;
++        guint8* payload;
++
++        if (FPI_DEVICE_GOODIXTLS53XD(dev)->psk_ok) {
++            fpi_ssm_next_state(ssm);
++            break;
++        }
++
++        payload = psk_write_payload(&payload_length);
++        goodix_send_protocol(dev, GOODIX_CMD_PRESET_PSK_WRITE, payload,
++                             payload_length, g_free, TRUE, GOODIX_TIMEOUT, TRUE,
++                             check_preset_psk_write, ssm);
++        break;
++    }
++
+     case OPEN_RESET:
+         goodix_send_reset(dev, TRUE, 20, check_reset, ssm);
+         break;
+diff --git i/libfprint/drivers/goodixtls/goodix53xd.h w/libfprint/drivers/goodixtls/goodix53xd.h
+index 349a75a..1406562 100644
+--- i/libfprint/drivers/goodixtls/goodix53xd.h
++++ w/libfprint/drivers/goodixtls/goodix53xd.h
+@@ -35,6 +35,25 @@ const guint8 goodix_53xd_psk_0[] = {
+     0x8b, 0x8e, 0x9f, 0x8e, 0x20, 0x08, 0x97, 0x14, 0x85, 0x6e, 0xe2, 
+     0x33, 0xb3, 0x90, 0x2a, 0x59, 0x1d, 0x0d, 0x5f, 0x29, 0x25};
+ 
++// Flags, pre-flags and white-box blob a preset-PSK write needs, taken from
++// goodix-fp-dump's driver_53xd.py (write_psk/PSK_WHITE_BOX). The blob wraps the
++// all-zero PSK whose hash is goodix_53xd_psk_0 above, so a sensor that accepts
++// this write reads back that hash and can complete the TLS-PSK handshake.
++#define GOODIX_53XD_PSK_WRITE_FLAGS (0xbb010003)
++
++const guint8 goodix_53xd_psk_write_pre_flags[] = {
++    0x56, 0xa5, 0xbb, 0x95, 0x6b, 0x7c, 0x8d, 0x9e, 0x00, 0x00};
++
++const guint8 goodix_53xd_psk_white_box[] = {
++    0xec, 0x35, 0xae, 0x3a, 0xbb, 0x45, 0xed, 0x3f, 0x12, 0xc4, 0x75, 0x1f,
++    0x1e, 0x5c, 0x2c, 0xc0, 0x5b, 0x3c, 0x54, 0x52, 0xe9, 0x10, 0x4d, 0x9f,
++    0x2a, 0x31, 0x18, 0x64, 0x4f, 0x37, 0xa0, 0x4b, 0x6f, 0xd6, 0x6b, 0x1d,
++    0x97, 0xcf, 0x80, 0xf1, 0x34, 0x5f, 0x76, 0xc8, 0x4f, 0x03, 0xff, 0x30,
++    0xbb, 0x51, 0xbf, 0x30, 0x8f, 0x2a, 0x98, 0x75, 0xc4, 0x1e, 0x65, 0x92,
++    0xcd, 0x2a, 0x2f, 0x9e, 0x60, 0x80, 0x9b, 0x17, 0xb5, 0x31, 0x60, 0x37,
++    0xb6, 0x9b, 0xb2, 0xfa, 0x5d, 0x4c, 0x8a, 0xc3, 0x1e, 0xdb, 0x33, 0x94,
++    0x04, 0x6e, 0xc0, 0x6b, 0xbd, 0xac, 0xc5, 0x7d, 0xa6, 0xa7, 0x56, 0xc5};
++
+ guint8 goodix_53xd_config[] = {
+     0x70, 0x11, 0x60, 0x71, 0x2c, 0x9d, 0x2c, 0xc9, 0x1c, 0xe5, 0x18,
+     0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x03, 0xba, 0x00, 0x01, 0x80, 0xca,

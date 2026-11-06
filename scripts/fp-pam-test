@@ -1,0 +1,33 @@
+#!/bin/bash
+# Prove that a PAM service accepts the fingerprint, without restarting anything.
+# Default service is sddm — the greeter stack used at boot.
+#
+#   scripts/fp-pam-test            # tests "sddm" for $USER
+#   scripts/fp-pam-test sudo       # or any other service name
+#
+# It compiles scripts/fp-pam-test.c to a temporary binary and runs it as root,
+# because pam_fprintd needs root to tell fprintd which user to verify.
+
+set -euo pipefail
+
+service=${1:-sddm}
+user=${2:-$USER}
+proj_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+src="$proj_dir/scripts/fp-pam-test.c"
+bin=$(mktemp /tmp/fp-pam-test.XXXXXX)
+
+trap 'rm -f "$bin"' EXIT
+
+if [[ ! -f /etc/pam.d/$service ]]; then
+  echo "No /etc/pam.d/$service — nothing to test." >&2
+  exit 1
+fi
+
+gcc -O2 -o "$bin" "$src" -lpam
+chmod 755 "$bin"
+
+echo "PAM stack /etc/pam.d/$service:"
+sed 's/^/    /' "/etc/pam.d/$service"
+echo
+
+sudo "$bin" "$service" "$user"

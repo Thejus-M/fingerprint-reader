@@ -1,0 +1,37 @@
+#!/bin/bash
+# Undo fp-login-enable: take pam_fprintd out of the SDDM greeter stack and put
+# SDDM autologin back. Safe to run from a text console (Ctrl+Alt+F2).
+
+set -euo pipefail
+
+pam_file=/etc/pam.d/sddm
+
+if grep -qE 'pam_fprintd\.so|omarchy-hw-laptop-closed' "$pam_file"; then
+  sudo sed -i -E -e '/pam_fprintd\.so/d' -e '/omarchy-hw-laptop-closed/d' "$pam_file"
+  echo "Removed the fingerprint lines from $pam_file"
+else
+  echo "$pam_file has no fingerprint lines."
+fi
+
+shopt -s nullglob
+restored=0
+if [[ -f /etc/sddm.autologin.conf.disabled ]]; then
+  sudo mv -- /etc/sddm.autologin.conf.disabled /etc/sddm.conf.d/autologin.conf
+  echo "Restored /etc/sddm.conf.d/autologin.conf"
+  restored=1
+fi
+# Older layout: the file was renamed in place (which never disabled anything,
+# since sddm reads every file in that directory).
+for f in /etc/sddm.conf.d/*.disabled; do
+  sudo mv -- "$f" "${f%.disabled}"
+  echo "Restored ${f%.disabled}"
+  restored=1
+done
+if [[ -f /etc/sddm.conf ]] && grep -qE '^\s*#?(User|Session)\s*=\s*$' /etc/sddm.conf; then
+  echo "Note: /etc/sddm.conf has empty Autologin User/Session — restore the user name by hand"
+  echo "      from the copy in backup/ if you want autologin from that file."
+fi
+(( restored )) || echo "No disabled autologin config to restore."
+
+echo
+echo "Takes effect at the next boot (or: sudo systemctl restart sddm, which ends this session)."

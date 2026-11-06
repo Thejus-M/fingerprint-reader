@@ -1,0 +1,131 @@
+#!/bin/bash
+# Read-only health check for the Goodix 27c6:538d fingerprint setup.
+# Prints one line per check with OK / WARN / FAIL, and exits non-zero if any FAIL.
+
+set -uo pipefail
+
+EXPECTED_PKG_VER="2:1.94.100.goodix538d.1-1"
+fail=0
+
+ok()   { printf '  \e[32mOK\e[0m    %s\n' "$1"; }
+warn() { printf '  \e[33mWARN\e[0m  %s\n' "$1"; }
+bad()  { printf '  \e[31mFAIL\e[0m  %s\n' "$1"; fail=1; }
+section() { printf '\n\e[1m%s\e[0m\n' "$1"; }
+
+section "Driver package"
+installed=$(pacman -Q libfprint-git 2>/dev/null | awk '{print $2}')
+if [[ -z $installed ]]; then
+  bad "libfprint-git is not installed"
+elif [[ $installed == "$EXPECTED_PKG_VER" ]]; then
+  ok "libfprint-git $installed (the goodixtls53xd fork)"
+else
+  bad "libfprint-git $installed — expected $EXPECTED_PKG_VER; run fp-restore-driver"
+fi
+repo=$(pacman -Si libfprint-git 2>/dev/null | awk -F': ' '/^Version/{print $2; exit}')
+[[ -n $repo ]] && printf '        repo offers %s\n' "$repo"
+
+if [[ -n $(pacman -Qu libfprint-git 2>/dev/null) ]]; then
+  bad "pacman offers an upgrade for libfprint-git — the epoch guard is gone"
+else
+  ok "no upgrade offered, so pacman -Syu / omarchy update cannot replace the driver"
+fi
+
+if omarchy-pkg-missing libfprint-git fprintd usbutils 2>/dev/null; then
+  bad "omarchy-pkg-missing reports a package missing — the omarchy menu would reinstall stock libfprint"
+else
+  ok "omarchy-pkg-missing passes, so the omarchy Fingerprint entry skips the package step"
+fi
+
+if grep -qE '^\s*IgnorePkg.*libfprint' /etc/pacman.conf; then
+  warn "/etc/pacman.conf has an IgnorePkg entry for libfprint (not needed; the epoch handles it)"
+else
+  ok "/etc/pacman.conf is stock (no IgnorePkg needed)"
+fi
+
+section "Hardware and daemon"
+if lsusb -d 27c6:538d >/dev/null 2>&1; then
+  ok "sensor present on USB: $(lsusb -d 27c6:538d | sed 's/^.*ID //')"
+else
+  bad "sensor 27c6:538d not found on USB"
+fi
+state=$(systemctl is-active fprintd 2>/dev/null)
+case $state in
+  active|inactive) ok "fprintd $state (socket/dbus activated, inactive is normal)" ;;
+  *)               bad "fprintd is $state" ;;
+esac
+if systemctl is-enabled fprintd 2>/dev/null | grep -q masked; then
+  bad "fprintd is masked — unmask it: sudo systemctl unmask fprintd"
+fi
+
+section "Device and enrolment"
+list=$(fprintd-list "$USER" 2>&1)
+if grep -q "No devices available" <<<"$list"; then
+  bad "fprintd sees no device — the driver is not driving the sensor"
+elif grep -q "has no fingers enrolled" <<<"$list"; then
+  bad "device present but nothing enrolled — run: fprintd-enroll $USER"
+elif grep -q "^ - #" <<<"$list"; then
+  ok "device: $(grep -o 'Goodix[^(]*' <<<"$list" | head -1 | sed 's/ *$//')"
+  ok "enrolled:$(grep -o '#[0-9]*: .*' <<<"$list" | tr '\n' ' ')"
+else
+  warn "unexpected fprintd-list output:"; sed 's/^/        /' <<<"$list"
+fi
+
+section "PAM wiring"
+for f in /etc/pam.d/sudo /etc/pam.d/polkit-1; do
+  if grep -q pam_fprintd.so "$f" 2>/dev/null; then
+    if grep -q omarchy-hw-laptop-closed "$f"; then
+      ok "$f: pam_fprintd + clamshell gate"
+    else
+      warn "$f: pam_fprintd without the clamshell gate (lid-closed auth will stall on the reader)"
+    fi
+  else
+    warn "$f: no pam_fprintd (fingerprint not offered here)"
+  fi
+done
+if [[ -f /etc/pam.d/omarchy-lock-fingerprint ]]; then
+  ok "/etc/pam.d/omarchy-lock-fingerprint present (lock screen takes the finger)"
+else
+  warn "/etc/pam.d/omarchy-lock-fingerprint missing (lock screen password only)"
+fi
+if grep -q pam_fprintd.so /etc/pam.d/sddm 2>/dev/null; then
+  ok "/etc/pam.d/sddm: pam_fprintd (greeter takes the finger)"
+else
+  printf '        /etc/pam.d/sddm: no pam_fprintd (greeter is password only)\n'
+fi
+
+section "Boot login path"
+# sddm.conf(5): "Configuration loads all files in the configuration
+# directories" — every file counts, whatever its extension, and the later file
+# wins. So a file renamed to .disabled inside /etc/sddm.conf.d is still read.
+autologin_user=""
+autologin_src=""
+shopt -s dotglob nullglob
+for f in /usr/lib/sddm/sddm.conf.d/* /etc/sddm.conf.d/* /etc/sddm.conf; do
+  [[ -f $f ]] || continue
+  u=$(awk '
+    /^[[:space:]]*\[/ { in_al = ($0 ~ /^[[:space:]]*\[Autologin\]/); next }
+    in_al && /^[[:space:]]*User[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]+$/, ""); print
+    }
+  ' "$f" | tail -1)
+  [[ -n ${u:-} ]] && { autologin_user=$u; autologin_src=$f; }
+done
+shopt -u dotglob
+if [[ -n $autologin_user ]]; then
+  printf '        SDDM autologin is ON for user "%s" (from %s)\n' "$autologin_user" "$autologin_src"
+  printf '        The greeter asks for nothing at boot, so the finger is never read there.\n'
+  printf '        Fix: scripts/fp-login-enable\n'
+  grep -q pam_fprintd.so /etc/pam.d/sddm 2>/dev/null &&
+    warn "/etc/pam.d/sddm is wired for fingerprint but autologin bypasses the greeter entirely"
+else
+  printf '        SDDM autologin is OFF — the greeter prompts at boot\n'
+fi
+last_stack=$(journalctl -b -u sddm --no-pager 2>/dev/null | grep -oE 'sddm-(autologin|greeter)?[a-z-]*\(sddm[a-z-]*:session\)' | tail -1)
+[[ -n ${last_stack:-} ]] && printf '        This boot authenticated through: %s\n' "$last_stack"
+if lsblk -o FSTYPE | grep -q crypto_LUKS; then
+  printf '        root is on LUKS — the boot passphrase cannot be replaced by a fingerprint (TPM2/FIDO2 only)\n'
+fi
+
+printf '\n'
+(( fail )) && { printf '\e[31mProblems found.\e[0m See REPORT.md §10.\n'; exit 1; }
+printf '\e[32mAll good.\e[0m\n'

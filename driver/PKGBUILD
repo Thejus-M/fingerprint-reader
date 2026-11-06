@@ -1,0 +1,83 @@
+# Maintainer: local build
+# Contributor: Timothy Gu <timothygu99@gmail.com>
+# Contributor: Ivan Shapovalov <intelfx@intelfx.name>
+
+## links
+# https://github.com/lbssousa/libfprint  (fork adding the goodixtls53xd driver)
+# https://gitlab.freedesktop.org/libfprint/libfprint  (upstream)
+
+## basic info
+_pkgname="libfprint"
+pkgname="$_pkgname-git"
+_tag="v1.94.100-goodix538d.1"
+pkgver=1.94.100.goodix538d.1
+pkgrel=1
+# Epoch 2 keeps this ahead of the omarchy repo's 1:1.94.100.r10.g6f9479c-3, so
+# `pacman -Syu` never replaces it and `omarchy setup security fingerprint`
+# finds libfprint-git already installed (it checks the exact name with
+# `pacman -Q`) and skips reinstalling the stock build over this driver.
+epoch=2
+pkgdesc="Library for fingerprint readers - with the goodixtls53xd driver for Goodix 27c6:538d"
+url="https://github.com/lbssousa/libfprint"
+license=('LGPL-2.1-or-later')
+arch=('x86_64')
+groups=('fprint')
+options=(!debug)
+
+depends=(
+  libgudev
+  libgusb
+  nss
+  openssl
+  pixman
+)
+makedepends=(
+  git
+  glib2-devel
+  gobject-introspection
+  meson
+)
+
+provides=(
+  "$_pkgname=1.94.100"
+  "libfprint-goodix538d=$pkgver"
+  'libfprint-2.so'
+)
+conflicts=("$_pkgname")
+
+_pkgsrc="$_pkgname"
+source=("$_pkgsrc"::"git+$url.git#tag=$_tag"
+        0001-goodixtls53xd-write-white-box-psk.patch)
+sha256sums=('SKIP'
+            'SKIP')
+
+prepare() {
+  cd "$_pkgsrc"
+
+  # Only reachable with -Dintrospection=false: the fallback block iterates the
+  # drivers_tests dict with a single loop variable, which meson rejects.
+  sed -i 's/^    foreach driver_test: drivers_tests$/    foreach driver_test, _unused: drivers_tests/' \
+    tests/meson.build
+
+  # This sensor was paired by its OEM driver, so it holds a PSK the driver does
+  # not know and the TLS-PSK handshake fails. Let the driver write the community
+  # white-box PSK once, instead of only comparing and giving up.
+  patch -Np1 -i "$srcdir/0001-goodixtls53xd-write-white-box-psk.patch"
+}
+
+build() {
+  local _meson_opts=(
+    -Ddrivers=all
+    -Dintrospection=false
+    -Ddoc=false
+    -Dgtk-examples=false
+    -Dinstalled-tests=false
+  )
+
+  arch-meson "$_pkgsrc" build "${_meson_opts[@]}"
+  meson compile -C build
+}
+
+package() {
+  DESTDIR="$pkgdir" meson install -C build
+}
